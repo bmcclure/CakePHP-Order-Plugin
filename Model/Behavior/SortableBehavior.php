@@ -6,9 +6,15 @@
  * Based on: http://bakery.cakephp.org/articles/dardosordi/2008/07/29/sortablebehavior-sort-your-models-arbitrarily
  */
  class SortableBehavior extends ModelBehavior {
+	 protected $_defaultSettings = array(
+	 	'field' => 'position',
+		'enabled' => true,
+		'cluster' => false
+	 );
+
  	public function setup($Model, $settings = array()) {
  		if (!isset($this->settings[$Model->alias])) {
-			$this->settings[$Model->alias] = array('field' => 'order', 'enabled' => true, 'cluster' => false);
+			$this->settings[$Model->alias] = $this->_defaultSettings;
 		}
 
 		$this->settings[$Model->alias] = array_merge($this->settings[$Model->alias], (array) $settings);
@@ -21,18 +27,18 @@
 			return $query;
 		}
 
-		if (is_string($query['fields']) && strpos($query['fields'], 'COUNT') === 0) {
+		if (isset($query['fields']) && is_string($query['fields']) && strpos($query['fields'], 'COUNT') === 0) {
 			return $query;
 		}
 
-		$order = (is_array($query['order'])) ? current($query['order']) : $query['order'];
+		if (isset($query['order']) && !empty($query['order'])) {
+			return $query;
+		}
 
-		if (empty($order)) {
-			$query['order'] = array(array($this->_fieldName($Model) => 'ASC'));
+		$query['order'] = array($this->_fieldName($Model) => 'ASC');
 
-			if ($group !== false) {
-				$query['order'] = array_merge(array($group => 'ASC'), $query['order']);
-			}
+		if ($cluster !== false) {
+			$query['order'] = array_merge(array($cluster => 'ASC'), $query['order']);
 		}
 
 		return $query;
@@ -45,9 +51,13 @@
 			return true;
 		}
 
-		$fixPosition = false;
 		$isInsert = !$Model->id;
-		$newPosition = (isset($Model->data[$Model->alias][$field]) && !empty($Model->data[$Model->alias][$field])) ? $Model->data[$Model->alias][$field] : null;
+
+		$newPosition = null;
+		if (isset($Model->data[$Model->alias][$field]) && !empty($Model->data[$Model->alias][$field])) {
+			$newPosition = $Model->data[$Model->alias][$field];
+		}
+
 		$clusterId = $this->_clusterId($Model);
 
 		$Model->data[$Model->alias][$field] = $this->lastPosition($Model, $clusterId) + 1;
@@ -103,34 +113,54 @@
 	}
 
 	public function moveTop($Model, $id = null) {
-		return $this->setPosition($Model, $id, 1);
+		$this->setPosition($Model, $id, 1);
 	}
 
 	public function moveUp($Model, $id = null, $step = 1) {
-		return $this->setPosition($Model, $id, $this->position($Model, $id) - $step);
+		$this->setPosition($Model, $id, $this->position($Model, $id) - $step);
 	}
 
 	public function moveDown($Model, $id = null, $step = 1) {
-		return $this->setPosition($Model, $id, $this->position($Model, $id) + $step);
+		$this->setPosition($Model, $id, $this->position($Model, $id) + $step);
 	}
 
 	public function moveBottom($Model, $id = null) {
-		return $this->setPosition($Model, $id, $this->lastPosition($Model, $this->_clusterId($Model, $id)));
+		$this->setPosition($Model, $id, $this->lastPosition($Model, $this->_clusterId($Model, $id)));
+	}
+
+	protected function _disable($Model) {
+		// Cache the previous state
+		$this->_enable($Model, $this->settings[$Model->alias]['enabled']);
+
+		$this->settings[$Model->alias]['enabled'] = false;
+	}
+
+	protected function _enable($Model, $cacheValue = null) {
+		if ($cacheValue != null) {
+			if (!isset($cached)) {
+				static $cached = array();
+			}
+
+			$cached[$Model->alias] = $cacheValue;
+			return;
+		}
+
+		$enable = true;
+		if (isset($cached[$Model->alias])) {
+			$enable = $cached[$Model->alias];
+
+			unset($cached[$Model->alias]);
+		}
+
+		$this->settings[$Model->alias]['enabled'] = $enable;
 	}
 
 	public function setPosition($Model, $id = null, $destination = 1) {
-		$this->settings[$Model->alias]['enabled'] = false;
+		$this->_disable($Model);
 
 		extract($this->settings[$Model->alias]);
 
-		if ($id) {
-			$Model->id = $id;
-		}
-
 		$position = $this->position($Model);
-
-		$id = $Model->id;
-		$Model->id = null;
 
 		$clusterId = $this->_clusterId($Model);
 		$fieldName = $this->_fieldName($Model);
@@ -157,15 +187,28 @@
 				$updateValue = '-';
 			}
 
-			$query = $this->_query($Model, $clusterId, array("$fieldName $operator1" => $position, "$fieldName $operator2" => $destination));
+			$Model->updateAll(array($fieldName => "$fieldName $updateValue 1"), $this->_conditions($Model, $clusterId, array(
+				"$fieldName $operator1" => $position,
+				"$fieldName $operator2" => $destination
+			)));
 
-			$Model->updateAll(array($fieldName => "$fieldName $updateValue 1"), $query);
-			$Model->saveField($field, $destination);
+			$this->_savePosition($Model, $id, $destination);
 		}
 
-		$this->settings[$Model->alias]['enabled'] = true;
+		$this->_enable($Model);
+	}
 
-		return true;
+	protected function _savePosition($Model, $id = null, $position = 1) {
+		if (!is_null($id)) {
+			$oldId = $Model->id;
+			$Model->id = $id;
+		}
+
+		$Model->saveField($this->settings[$Model->alias]['field'], $position);
+
+		if (!is_null($id)) {
+			$Model->id = $oldId;
+		}
 	}
 
 	public function position($Model, $id = null) {
@@ -177,52 +220,53 @@
 	}
 
 	public function lastPosition($Model, $clusterId = null) {
-		$id = $Model->id;
-
-		$Model->id = null;
-
 		$field = $this->settings[$Model->alias]['field'];
-		$fields = array($field);
- 		$order = array($field => 'DESC');
-		$query = $this->_query($Model, $clusterId);
-		$last = $Model->find('first',  compact('fields', 'order', 'conditions'));
 
-		$Model->id = $id;
+		$last = $Model->find('first', array(
+			'fields' => array($field),
+			'order' => array($field => 'DESC'),
+			'conditions' => $this->_conditions($Model, $clusterId),
+		));
 
-		return (!empty($last)) ? current(current($last)) : false;
+		return (!empty($last)) ? $last[$Model->alias][$field] : 0;
+	}
+
+	public function findByPosition($Model, $position, $clusterId = null) {
+		$field = $this->_fieldName($Model);
+
+		return $Model->find('first', array('conditions' => $this->_conditions($Model, $clusterId, array($field => $position))));
 	}
 
 	protected function _fieldName($Model) {
 		return $Model->alias.'.'.$this->settings[$Model->alias]['field'];
 	}
 
-	protected function _clusterId(&$model, $id = null) {
+	protected function _clusterId($Model, $id = null) {
 		$cluster = $this->settings[$Model->alias]['cluster'];
 
-		if ($cluster === false) {
+		if (is_null($cluster) || ($cluster === false)) {
 			return null;
 		}
 
 		if ($id) {
 			$Model->id = $id;
 		}
+		$clusterId = $Model->field($cluster);
 
-		return $Model->field($cluster);
+		if(!empty($Model->data[$Model->alias][$cluster])){
+			$clusterId = $Model->data[$Model->alias][$cluster];
+		}
+
+		return $clusterId;
 	}
 
-	function _query($Model, $clusterId = null, $query = array()) {
+	protected function _conditions($Model, $clusterId = null, $conditions = array()) {
 		$cluster = $this->settings[$Model->alias]['cluster'];
 
 		if (($cluster !== false) && !is_null($clusterId)) {
-			$query = array_merge($query, array($cluster => $clusterId));
+			$conditions = array_merge($conditions, array($cluster => $clusterId));
 		}
 
-		return $query;
-	}
-
-	public function findByPosition($Model, $position, $clusterId = null) {
-		$field = $this->_fieldName($Model);
-
-		return $Model->find($this->_query($Model, $clusterId, array($field => $position)));
+		return $conditions;
 	}
  }
